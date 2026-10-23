@@ -99,10 +99,20 @@ def build_calibration_dataset(tokenizer, samples, num_samples, max_seq_length):
         raise ValueError("Tokenizer must define an EOS token for document boundaries.")
     blocks, buffer = [], []
     for sample in samples:
-        if "text" not in sample:
-            raise ValueError("Calibration dataset must contain a text column.")
+        if "text" in sample:
+            text = sample["text"]
+        elif "conversations" in sample:
+            # Match the project's existing AWQ ToolACE calibration text format.
+            parts = [sample.get("system", "")]
+            parts.extend(
+                turn.get("value") or turn.get("content") or ""
+                for turn in sample["conversations"]
+            )
+            text = "\n".join(part for part in parts if part)
+        else:
+            raise ValueError("Calibration data requires text or ToolACE conversations.")
         buffer.extend(
-            tokenizer(sample["text"], add_special_tokens=False, truncation=False)[
+            tokenizer(text, add_special_tokens=False, truncation=False)[
                 "input_ids"
             ]
         )
@@ -130,7 +140,7 @@ def main():
     parser.add_argument(
         "--dataset",
         default="/ssd/zhaozichen/huggingface/datasets/en/c4-train.00000-of-01024.json.gz",
-        help="Local JSON/JSONL calibration data with a text column.",
+        help="Local JSON/JSONL calibration data with text or ToolACE conversations.",
     )
     parser.add_argument(
         "--num-calibration-samples", type=int, default=256,
