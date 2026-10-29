@@ -18,6 +18,24 @@ from calibration_data import (
 )
 
 
+class MemoryEfficientAWQModifier(AWQModifier):
+    """Offload search outputs without retaining whole-dataset attention matrices."""
+
+    @torch.no_grad()
+    def _run_samples(self, module: torch.nn.Module) -> list[torch.Tensor]:
+        outputs = []
+        # Deliberately avoid prefetch: only one sample needs to be on device.
+        for batch in self._parent_args_cache[module]:
+            result = module(**batch)
+            hidden_states = result[0] if isinstance(result, tuple) else result
+            # Float32 also lets the inherited MSE loss run on CPU for bf16 models.
+            outputs.append(hidden_states.detach().to(device="cpu", dtype=torch.float32))
+            # The base implementation collects every complete return tuple first;
+            # drop its unused attention weights before running the next sample.
+            del result, hidden_states, batch
+        return outputs
+
+
 def data_collator(batch):
     """Preserve processor batch dimensions and variable image patch counts."""
     if len(batch) != 1:
@@ -82,7 +100,9 @@ def main():
             },
         }}}
     recipe = [
-        AWQModifier(duo_scaling=False),
+        MemoryEfficientAWQModifier(
+            duo_scaling=False, offload_device=torch.device("cpu"),
+        ),
         QuantizationModifier(
             targets="Linear", **quantization,
             ignore=[
@@ -98,6 +118,8 @@ def main():
         max_seq_length=args.max_seq_length, batch_size=1,
         data_collator=data_collator,
         sequential_targets=["Qwen3_5DecoderLayer"],
+        sequential_offload_device="cpu",
+        sequential_prefetch=False,
     )
 
     print("========== SAMPLE GENERATION ==============")
