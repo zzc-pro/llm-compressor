@@ -42,6 +42,7 @@ def _load_report(path):
 @torchrun(world_size=2)
 def test_reap_ddp_qwen3():
     """REAP with DDP on Qwen3.8-1.0B-A0.6B retains the same experts as single-GPU."""
+    torch.use_deterministic_algorithms(True)
     with tempfile.TemporaryDirectory() as tmpdir:
         ref_report = f"{tmpdir}/ref_report.json"
 
@@ -65,7 +66,7 @@ def test_reap_ddp_qwen3():
             pipeline="sequential",
         )
 
-        ref_retained = _load_report(ref_report)
+        ref_saliency = _load_report(ref_report)["saliency"]
         del model_ref
         torch.accelerator.empty_cache()
 
@@ -95,12 +96,28 @@ def test_reap_ddp_qwen3():
         )
 
         if rank == 0:
-            ddp_retained = _load_report(ddp_report)
-            assert ref_retained == ddp_retained, (
-                f"Retained experts differ between single-GPU and DDP.\n"
-                f"  ref: {ref_retained}\n"
-                f"  ddp: {ddp_retained}"
+            ddp_saliency = _load_report(ddp_report)["saliency"]
+            assert len(ref_saliency) == len(ddp_saliency), (
+                f"Number of MoE layers differ between single-GPU and DDP.\n"
+                f"  ref: {len(ref_saliency)}\n"
+                f"  ddp: {len(ddp_saliency)}"
             )
+            for layer_idx, (ref_layer, ddp_layer) in enumerate(
+                zip(ref_saliency, ddp_saliency)
+            ):
+                torch.testing.assert_close(
+                    torch.tensor(ref_layer, dtype=torch.float64),
+                    torch.tensor(ddp_layer, dtype=torch.float64),
+                    # statistics are accumulated in float32, so the single-gpu
+                    # and ddp runs sum the same contributions in a different
+                    # order; allow small differences
+                    rtol=1e-5,
+                    atol=1e-3,
+                    msg=lambda m, i=layer_idx: (
+                        f"Saliency scores differ between single-GPU and DDP "
+                        f"at layer {i}.\n{m}"
+                    ),
+                )
 
         del model_ddp
         torch.accelerator.empty_cache()
