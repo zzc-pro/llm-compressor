@@ -5,7 +5,6 @@ from pathlib import Path
 
 import torch
 from compressed_tensors.offload import dispatch_model
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
 from llmcompressor import oneshot
@@ -14,71 +13,9 @@ from llmcompressor.modifiers.transform.awq import AWQModifier
 from llmcompressor.utils import load_context
 
 from awq import save_ste_model
-
-
-def load_local_dataset(path, split):
-    """Read a saved HF dataset, a Parquet repository, or a local data file."""
-    path = Path(path).expanduser().resolve()
-    if not path.exists():
-        raise ValueError(f"Calibration dataset does not exist: {path}")
-    if path.is_dir():
-        if (path / "dataset_dict.json").is_file() or (path / "dataset_info.json").is_file():
-            dataset = load_from_disk(str(path))
-            return dataset[split] if isinstance(dataset, DatasetDict) else dataset
-        files = sorted(path.glob(f"data/{split}-*.parquet"))
-        if not files:
-            files = sorted(path.glob(f"{split}-*.parquet"))
-        if not files:
-            raise ValueError(f"No Parquet shards for split {split!r} in {path}")
-        return load_dataset(
-            "parquet", data_files={split: [str(file) for file in files]}, split=split,
-        )
-    loader = "parquet" if path.suffix == ".parquet" else "json"
-    return load_dataset(loader, data_files=str(path), split="train")
-
-
-def build_calibration_dataset(processor, samples, num_samples, max_seq_length,
-                              image_column, prompt, image_root):
-    """Keep complete image-text examples without truncating image tokens."""
-    rows = []
-    for sample in samples:
-        image = sample[image_column]
-        if isinstance(image, str):
-            path = Path(image).expanduser()
-            if not path.is_absolute():
-                path = image_root / path
-            path = path.resolve()
-            if not path.is_file():
-                raise ValueError(f"Calibration image does not exist: {path}")
-            from PIL import Image
-
-            with Image.open(path) as source:
-                image = source.convert("RGB")
-        if image is None:
-            raise ValueError(f"Missing image in column {image_column!r}")
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt},
-            ],
-        }]
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        encoded = processor(
-            text=[text], images=[image], padding=False, truncation=False,
-            return_tensors="pt",
-        )
-        if encoded["input_ids"].shape[-1] > max_seq_length:
-            continue
-        rows.append({key: value.tolist() for key, value in encoded.items()})
-        if len(rows) == num_samples:
-            return Dataset.from_list(rows)
-    raise ValueError(
-        f"Only {len(rows)} usable image-text samples; requested {num_samples}. "
-        "Increase --max-seq-length or provide more calibration images."
-    )
+from calibration_data import (
+    build_calibration_dataset, load_eb_nav_dataset, load_local_dataset,
+)
 
 
 def data_collator(batch):
@@ -92,11 +29,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Local dense Qwen3.5 model directory.")
     parser.add_argument("--dataset", required=True,
-                        help="Local saved HF dataset, Parquet repository, or JSON/JSONL/Parquet file.")
+                        help="Local Flickr30k data or original EB-Nav multi-step JSON/directory.")
+    parser.add_argument("--dataset-type", choices=("flickr30k", "eb-nav"), default="flickr30k")
+    parser.add_argument("--exclude-task-split", type=Path,
+                        help="EB-Nav SP split.json whose validation tasks must be excluded.")
     parser.add_argument("--split", default="train")
     parser.add_argument("--image-column", default="image")
     parser.add_argument("--image-root", type=Path,
-                        help="Root for image paths; defaults to the dataset directory.")
+                        help="Root for image paths or EB-Nav images.zip; required for EB-Nav.")
     parser.add_argument("--prompt", default="What does the image show?")
     parser.add_argument("--num-calibration-samples", type=int, default=512)
     parser.add_argument("--max-seq-length", type=int, default=2048)
@@ -107,21 +47,30 @@ def main():
     if args.num_calibration_samples < 1 or args.max_seq_length < 1:
         parser.error("Calibration sample count and sequence length must be positive.")
 
+    if args.dataset_type == "eb-nav" and args.image_root is None:
+        parser.error("--dataset-type eb-nav requires --image-root.")
+    if args.dataset_type != "eb-nav" and args.exclude_task_split is not None:
+        parser.error("--exclude-task-split is only used with --dataset-type eb-nav.")
+
     processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
-    with load_context(Qwen3_5ForConditionalGeneration):
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            args.model, dtype="auto", local_files_only=True,
-        )
     dataset_path = Path(args.dataset).expanduser().resolve()
     image_root = args.image_root or (
         dataset_path if dataset_path.is_dir() else dataset_path.parent
     )
-    samples = load_local_dataset(dataset_path, args.split).shuffle(seed=42)
+    if args.dataset_type == "eb-nav":
+        samples = load_eb_nav_dataset(dataset_path, args.exclude_task_split)
+    else:
+        samples = load_local_dataset(dataset_path, args.split).shuffle(seed=42)
     dataset = build_calibration_dataset(
         processor, samples, args.num_calibration_samples, args.max_seq_length,
-        args.image_column, args.prompt, image_root,
+        "image" if args.dataset_type == "eb-nav" else args.image_column, args.prompt, image_root,
     )
     print(f"Calibration: {len(dataset)} complete image-text samples")
+
+    with load_context(Qwen3_5ForConditionalGeneration):
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+            args.model, dtype="auto", local_files_only=True,
+        )
 
     quantization = {"scheme": "W4A16"}
     if args.save_format == "ste":
@@ -153,8 +102,13 @@ def main():
 
     print("========== SAMPLE GENERATION ==============")
     dispatch_model(model)
+    generation_dataset = build_calibration_dataset(
+        processor, samples, 1, args.max_seq_length,
+        "image" if args.dataset_type == "eb-nav" else args.image_column, args.prompt, image_root,
+        generation_prompt=True,
+    )
     inputs = {key: value.to(model.device)
-              for key, value in data_collator([dataset[0]]).items()}
+              for key, value in data_collator([generation_dataset[0]]).items()}
     with torch.no_grad():
         output = model.generate(**inputs, max_new_tokens=32, do_sample=False)
     print(processor.decode(
