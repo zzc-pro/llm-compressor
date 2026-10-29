@@ -1,4 +1,4 @@
-"""Quantize the language backbone of a local Qwen3-VL model with AWQ W4A16."""
+"""Quantize the language backbone of a local dense Qwen3.5 model with AWQ W4A16."""
 
 import argparse
 from pathlib import Path
@@ -6,23 +6,33 @@ from pathlib import Path
 import torch
 from compressed_tensors.offload import dispatch_model
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform.awq import AWQModifier
+from llmcompressor.utils import load_context
 
 from awq import save_ste_model
 
 
 def load_local_dataset(path, split):
-    """Read a saved HF dataset or a local JSON/JSONL/Parquet file."""
+    """Read a saved HF dataset, a Parquet repository, or a local data file."""
     path = Path(path).expanduser().resolve()
     if not path.exists():
         raise ValueError(f"Calibration dataset does not exist: {path}")
     if path.is_dir():
-        dataset = load_from_disk(str(path))
-        return dataset[split] if isinstance(dataset, DatasetDict) else dataset
+        if (path / "dataset_dict.json").is_file() or (path / "dataset_info.json").is_file():
+            dataset = load_from_disk(str(path))
+            return dataset[split] if isinstance(dataset, DatasetDict) else dataset
+        files = sorted(path.glob(f"data/{split}-*.parquet"))
+        if not files:
+            files = sorted(path.glob(f"{split}-*.parquet"))
+        if not files:
+            raise ValueError(f"No Parquet shards for split {split!r} in {path}")
+        return load_dataset(
+            "parquet", data_files={split: [str(file) for file in files]}, split=split,
+        )
     loader = "parquet" if path.suffix == ".parquet" else "json"
     return load_dataset(loader, data_files=str(path), split="train")
 
@@ -80,9 +90,9 @@ def data_collator(batch):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Local Qwen3-VL model directory.")
+    parser.add_argument("--model", required=True, help="Local dense Qwen3.5 model directory.")
     parser.add_argument("--dataset", required=True,
-                        help="Local saved HF dataset or JSON/JSONL/Parquet file.")
+                        help="Local saved HF dataset, Parquet repository, or JSON/JSONL/Parquet file.")
     parser.add_argument("--split", default="train")
     parser.add_argument("--image-column", default="image")
     parser.add_argument("--image-root", type=Path,
@@ -97,10 +107,11 @@ def main():
     if args.num_calibration_samples < 1 or args.max_seq_length < 1:
         parser.error("Calibration sample count and sequence length must be positive.")
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model, dtype="auto", local_files_only=True,
-    )
     processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
+    with load_context(Qwen3_5ForConditionalGeneration):
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+            args.model, dtype="auto", local_files_only=True,
+        )
     dataset_path = Path(args.dataset).expanduser().resolve()
     image_root = args.image_root or (
         dataset_path if dataset_path.is_dir() else dataset_path.parent
@@ -125,7 +136,11 @@ def main():
         AWQModifier(duo_scaling=False),
         QuantizationModifier(
             targets="Linear", **quantization,
-            ignore=["re:.*lm_head", "re:.*visual.*"],
+            ignore=[
+                "re:.*lm_head", "re:.*visual.*",
+                r"re:.*linear_attn\.in_proj_a$",
+                r"re:.*linear_attn\.in_proj_b$",
+            ],
         ),
     ]
     oneshot(
@@ -133,7 +148,7 @@ def main():
         num_calibration_samples=args.num_calibration_samples,
         max_seq_length=args.max_seq_length, batch_size=1,
         data_collator=data_collator,
-        sequential_targets=["Qwen3VLTextDecoderLayer"],
+        sequential_targets=["Qwen3_5DecoderLayer"],
     )
 
     print("========== SAMPLE GENERATION ==============")
