@@ -782,6 +782,10 @@ fabric.properties
 ### Linux template
 *~
 
+# Crash core dumps generated in the repository root
+/core
+/core.[0-9]*
+
 # temporary files which can be created if a process still has a handle open of a deleted file
 .fuse_hidden*
 
