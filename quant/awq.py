@@ -16,8 +16,12 @@ from llmcompressor.modifiers.transform.awq import AWQModifier
 
 
 @torch.no_grad()
-def save_ste_model(model, tokenizer, save_dir):
-    """Export plain HF weights and unsigned affine int4 grids for existing STE code."""
+def save_ste_model(model, tokenizer, save_dir, bits=4):
+    """Export BF16 HF weights on unsigned affine integer grids for STE."""
+    if bits not in (2, 4, 8):
+        raise ValueError("STE export supports 2, 4, or 8 bits")
+    offset = 2 ** (bits - 1)
+    maxq = 2**bits - 1
     state_dict, layers = {}, {}
     for name, module in model.named_modules():
         prefix = f"{name}." if name else ""
@@ -27,7 +31,7 @@ def save_ste_model(model, tokenizer, save_dir):
                 args = scheme.weights
                 if (
                     not isinstance(module, torch.nn.Linear)
-                    or args.num_bits != 4
+                    or args.num_bits != bits
                     or args.type != "int"
                     or args.strategy != "group"
                     or args.group_size != 128
@@ -38,26 +42,28 @@ def save_ste_model(model, tokenizer, save_dir):
                     raise ValueError(f"Unsupported STE quantization scheme for {name}")
                 scale = module.weight_scale.detach().float().clone()
                 signed_zero = module.weight_zero_point.detach()
-                zero = signed_zero.float() + 8
+                zero = signed_zero.float() + offset
                 expected_shape = (module.out_features, module.in_features // 128)
                 if scale.shape != expected_shape or zero.shape != expected_shape:
                     raise ValueError(f"Unexpected quantization grid shape for {name}")
-                # compressed-tensors uses [-8, 7]; STE uses [0, 15].
+                # Shift signed integer codes and zero points to the unsigned STE grid.
                 codes = quantize(
                     module.weight, module.weight_scale, signed_zero, args,
                     dtype=torch.int8,
-                ).float() + 8
+                ).float() + offset
                 weight = (
                     (codes.reshape(module.out_features, -1, 128) - zero[..., None])
                     * scale[..., None]
-                ).reshape_as(module.weight).to(module.weight.dtype)
+                ).reshape_as(module.weight).to(torch.bfloat16)
                 state_dict[prefix + "weight"] = weight
                 if module.bias is not None:
-                    state_dict[prefix + "bias"] = module.bias.detach().cpu().clone()
+                    state_dict[prefix + "bias"] = (
+                        module.bias.detach().cpu().to(torch.bfloat16).clone()
+                    )
                 layers[name] = {
                     "scale": scale,
                     "zero": zero,
-                    "maxq": torch.tensor(15),
+                    "maxq": torch.tensor(maxq),
                 }
             else:
                 tensors = list(module.named_parameters(recurse=False)) + [
@@ -66,13 +72,15 @@ def save_ste_model(model, tokenizer, save_dir):
                     if key not in module._non_persistent_buffers_set
                 ]
                 for key, tensor in tensors:
-                    state_dict[prefix + key] = tensor.detach().cpu().clone()
+                    state_dict[prefix + key] = tensor.detach().cpu().to(
+                        torch.bfloat16 if tensor.is_floating_point() else tensor.dtype
+                    ).clone()
     if not layers:
         raise ValueError("No quantized Linear layers found for STE export")
     metadata = {
         "format_version": 1,
         "quantization_method": "awq",
-        "bits": 4,
+        "bits": bits,
         "groupsize": 128,
         "symmetric": False,
         "layers": layers,
@@ -147,21 +155,23 @@ def main():
         help="Number of complete token blocks to collect.",
     )
     parser.add_argument("--max-seq-length", type=int, default=512)
-    parser.add_argument("--bits", type=int, choices=[4, 8], default=4)
+    parser.add_argument("--bits", type=int, choices=[2, 4, 8], default=4)
     parser.add_argument("--save-dir", "--output", dest="save_dir", type=Path)
     parser.add_argument(
         "--save-format", choices=["compressed", "ste"], default="compressed",
-        help="STE saves plain HF weights plus asymmetric int4 awq_quantization.pt.",
+        help="STE saves BF16 HF weights plus asymmetric integer awq_quantization.pt.",
     )
     args = parser.parse_args()
     if args.num_calibration_samples < 1 or args.max_seq_length < 1:
         parser.error("Calibration sample count and sequence length must be positive.")
-    if args.save_format == "ste" and args.bits != 4:
-        parser.error("STE export requires --bits 4.")
+    if args.save_format == "compressed" and args.bits == 2:
+        parser.error("2-bit quantization requires --save-format ste for BF16 export.")
 
     # Load local weights on CPU; oneshot dispatches layers for calibration.
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype="auto", local_files_only=True
+        args.model,
+        dtype=torch.bfloat16 if args.save_format == "ste" else "auto",
+        local_files_only=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
 
@@ -174,7 +184,7 @@ def main():
     )
     print(f"Calibration: {len(dataset)} blocks x {args.max_seq_length} tokens")
 
-    # STE requires asymmetric int4 grids; compressed export keeps the default scheme.
+    # STE uses the requested asymmetric integer grid; compressed export uses presets.
     quantization = {"scheme": f"W{args.bits}A16"}
     if args.save_format == "ste":
         quantization = {
@@ -182,7 +192,7 @@ def main():
                 "group_0": {
                     "targets": ["Linear"],
                     "weights": {
-                        "num_bits": 4, "type": "int", "symmetric": False,
+                        "num_bits": args.bits, "type": "int", "symmetric": False,
                         "strategy": "group", "group_size": 128,
                     },
                 },
@@ -226,7 +236,7 @@ def main():
         / f"{Path(args.model).name}-AWQ-W{args.bits}A16"
     )
     if args.save_format == "ste":
-        save_ste_model(model, tokenizer, save_dir)
+        save_ste_model(model, tokenizer, save_dir, bits=args.bits)
     else:
         model.save_pretrained(save_dir, save_compressed=True)
         tokenizer.save_pretrained(save_dir)
