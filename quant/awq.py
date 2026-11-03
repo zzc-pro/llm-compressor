@@ -18,8 +18,8 @@ from llmcompressor.modifiers.transform.awq import AWQModifier
 @torch.no_grad()
 def save_ste_model(model, tokenizer, save_dir, bits=4):
     """Export BF16 HF weights on unsigned affine integer grids for STE."""
-    if bits not in (2, 4, 8):
-        raise ValueError("STE export supports 2, 4, or 8 bits")
+    if bits not in (2, 3, 4, 8):
+        raise ValueError("STE export supports 2, 3, 4, or 8 bits")
     offset = 2 ** (bits - 1)
     maxq = 2**bits - 1
     state_dict, layers = {}, {}
@@ -155,7 +155,7 @@ def main():
         help="Number of complete token blocks to collect.",
     )
     parser.add_argument("--max-seq-length", type=int, default=512)
-    parser.add_argument("--bits", type=int, choices=[2, 4, 8], default=4)
+    parser.add_argument("--bits", type=int, choices=[2, 3, 4, 8], default=4)
     parser.add_argument("--save-dir", "--output", dest="save_dir", type=Path)
     parser.add_argument(
         "--save-format", choices=["compressed", "ste"], default="compressed",
@@ -164,8 +164,8 @@ def main():
     args = parser.parse_args()
     if args.num_calibration_samples < 1 or args.max_seq_length < 1:
         parser.error("Calibration sample count and sequence length must be positive.")
-    if args.save_format == "compressed" and args.bits == 2:
-        parser.error("2-bit quantization requires --save-format ste for BF16 export.")
+    if args.save_format == "compressed" and args.bits in (2, 3):
+        parser.error(f"{args.bits}-bit quantization requires --save-format ste for BF16 export.")
 
     # Load local weights on CPU; oneshot dispatches layers for calibration.
     model = AutoModelForCausalLM.from_pretrained(
