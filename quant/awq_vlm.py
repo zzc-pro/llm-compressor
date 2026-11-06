@@ -20,7 +20,7 @@ from calibration_data import (
 from vlm_model import get_vlm_architecture
 
 class MemoryEfficientAWQModifier(AWQModifier):
-    """Offload search outputs without retaining whole-dataset attention matrices."""
+    """Cache search outputs on device without retaining attention matrices."""
 
     @torch.no_grad()
     def _run_samples(self, module: torch.nn.Module) -> list[torch.Tensor]:
@@ -29,8 +29,8 @@ class MemoryEfficientAWQModifier(AWQModifier):
         for batch in self._parent_args_cache[module]:
             result = module(**batch)
             hidden_states = result[0] if isinstance(result, tuple) else result
-            # Float32 also lets the inherited MSE loss run on CPU for bf16 models.
-            outputs.append(hidden_states.detach().to(device="cpu", dtype=torch.float32))
+            # Keep FP32 search outputs on device to avoid repeated CPU transfers and MSE.
+            outputs.append(hidden_states.detach().float())
             # The base implementation collects every complete return tuple first;
             # drop its unused attention weights before running the next sample.
             del result, hidden_states, batch
