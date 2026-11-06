@@ -1,11 +1,11 @@
-"""Quantize the language backbone of a local dense Qwen3.5 model with AWQ W4A16."""
+"""Quantize the language backbone of a local Qwen2.5-VL or dense Qwen3.5 model with AWQ W4A16."""
 
 import argparse
 from pathlib import Path
 
 import torch
 from compressed_tensors.offload import dispatch_model
-from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+from transformers import AutoProcessor
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -17,6 +17,7 @@ from calibration_data import (
     build_calibration_dataset, load_eb_nav_dataset, load_local_dataset,
 )
 
+from vlm_model import get_vlm_architecture
 
 class MemoryEfficientAWQModifier(AWQModifier):
     """Offload search outputs without retaining whole-dataset attention matrices."""
@@ -45,7 +46,7 @@ def data_collator(batch):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Local dense Qwen3.5 model directory.")
+    parser.add_argument("--model", required=True, help="Local Qwen2.5-VL or dense Qwen3.5 model directory.")
     parser.add_argument("--dataset", required=True,
                         help="Local Flickr30k data or original EB-Nav multi-step JSON/directory.")
     parser.add_argument("--dataset-type", choices=("flickr30k", "eb-nav"), default="flickr30k")
@@ -70,6 +71,7 @@ def main():
     if args.dataset_type != "eb-nav" and args.exclude_task_split is not None:
         parser.error("--exclude-task-split is only used with --dataset-type eb-nav.")
 
+    model_class, decoder_layer = get_vlm_architecture(args.model)
     processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
     dataset_path = Path(args.dataset).expanduser().resolve()
     image_root = args.image_root or (
@@ -85,8 +87,8 @@ def main():
     )
     print(f"Calibration: {len(dataset)} complete image-text samples")
 
-    with load_context(Qwen3_5ForConditionalGeneration):
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    with load_context(model_class):
+        model = model_class.from_pretrained(
             args.model, dtype="auto", local_files_only=True,
         )
 
@@ -117,7 +119,7 @@ def main():
         num_calibration_samples=args.num_calibration_samples,
         max_seq_length=args.max_seq_length, batch_size=1,
         data_collator=data_collator,
-        sequential_targets=["Qwen3_5DecoderLayer"],
+        sequential_targets=[decoder_layer],
         sequential_offload_device="cpu",
         sequential_prefetch=False,
     )
