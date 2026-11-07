@@ -1,14 +1,15 @@
 """Calibrate and quantize a local causal language model with AWQ."""
 
 import argparse
-from copy import deepcopy
 from pathlib import Path
 
 import torch
 from compressed_tensors.offload import align_module_device, dispatch_model
 from compressed_tensors.quantization.lifecycle.forward import quantize
 from datasets import Dataset, load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from ste_export import save_ste_checkpoint
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
@@ -85,19 +86,7 @@ def save_ste_model(model, tokenizer, save_dir, bits=4):
         "symmetric": False,
         "layers": layers,
     }
-    # Bypass the compressor's save wrapper and omit its runtime configuration.
-    original_config = model.config
-    model.config = deepcopy(original_config)
-    if hasattr(model.config, "quantization_config"):
-        del model.config.quantization_config
-    try:
-        PreTrainedModel.save_pretrained(
-            model, save_dir, state_dict=state_dict, max_shard_size="5GB",
-        )
-    finally:
-        model.config = original_config
-    tokenizer.save_pretrained(save_dir)
-    torch.save(metadata, save_dir / "awq_quantization.pt")
+    save_ste_checkpoint(model, tokenizer, save_dir, state_dict, metadata)
     print(f"Saved STE model and {len(layers)} quantization grids to {save_dir}")
 
 
@@ -222,13 +211,6 @@ def main():
         max_seq_length=args.max_seq_length,
     )
 
-    print("========== SAMPLE GENERATION ==============")
-    dispatch_model(model)
-    inputs = tokenizer("Hello my name is", return_tensors="pt").to(model.device)
-    output = model.generate(**inputs, max_new_tokens=20, do_sample=False)
-    print(tokenizer.decode(output[0], skip_special_tokens=True))
-    print("==========================================")
-
     # Export packed weights or the plain HF model and fixed grids used by STE.
     save_dir = args.save_dir or (
         Path(__file__).resolve().parent
@@ -241,6 +223,14 @@ def main():
         model.save_pretrained(save_dir, save_compressed=True)
         tokenizer.save_pretrained(save_dir)
     print(f"Saved AWQ model to {save_dir}")
+
+    # Save calibration results before optional sample generation can fail.
+    print("========== SAMPLE GENERATION ==============")
+    dispatch_model(model)
+    inputs = tokenizer("Hello my name is", return_tensors="pt").to(model.device)
+    output = model.generate(**inputs, max_new_tokens=20, do_sample=False)
+    print(tokenizer.decode(output[0], skip_special_tokens=True))
+    print("==========================================")
 
 
 if __name__ == "__main__":

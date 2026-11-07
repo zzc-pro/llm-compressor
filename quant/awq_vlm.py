@@ -124,6 +124,18 @@ def main():
         sequential_prefetch=False,
     )
 
+    save_dir = args.save_dir or (
+        Path(__file__).resolve().parent / "outputs"
+        / f"{Path(args.model).name}-AWQ-W4A16"
+    )
+    if args.save_format == "ste":
+        save_ste_model(model, processor, save_dir)
+    else:
+        model.save_pretrained(save_dir, save_compressed=True)
+        processor.save_pretrained(save_dir)
+    print(f"Saved AWQ VLM to {save_dir}")
+
+    # Save calibration results before optional sample generation can fail.
     print("========== SAMPLE GENERATION ==============")
     dispatch_model(model)
     generation_dataset = build_calibration_dataset(
@@ -138,17 +150,6 @@ def main():
     print(processor.decode(
         output[0, inputs["input_ids"].shape[-1]:], skip_special_tokens=True,
     ))
-
-    save_dir = args.save_dir or (
-        Path(__file__).resolve().parent / "outputs"
-        / f"{Path(args.model).name}-AWQ-W4A16"
-    )
-    if args.save_format == "ste":
-        save_ste_model(model, processor, save_dir)
-    else:
-        model.save_pretrained(save_dir, save_compressed=True)
-        processor.save_pretrained(save_dir)
-    print(f"Saved AWQ VLM to {save_dir}")
 
 
 if __name__ == "__main__":

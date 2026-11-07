@@ -1,13 +1,14 @@
 """Quantize the language backbone of a local Qwen2.5-VL or dense Qwen3.5 model with GPTQ W4A16."""
 
 import argparse
-from copy import deepcopy
 from pathlib import Path
 
 import torch
 from compressed_tensors.offload import align_module_device, dispatch_model
 from compressed_tensors.quantization.lifecycle.forward import quantize
-from transformers import AutoProcessor, PreTrainedModel
+from transformers import AutoProcessor
+
+from ste_export import save_ste_checkpoint
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.gptq import GPTQModifier
@@ -84,19 +85,7 @@ def save_ste_model(model, processor, save_dir):
         "symmetric": False,
         "layers": layers,
     }
-    # Bypass the compressor's save wrapper and omit its runtime configuration.
-    original_config = model.config
-    model.config = deepcopy(original_config)
-    if hasattr(model.config, "quantization_config"):
-        del model.config.quantization_config
-    try:
-        PreTrainedModel.save_pretrained(
-            model, save_dir, state_dict=state_dict, max_shard_size="5GB",
-        )
-    finally:
-        model.config = original_config
-    processor.save_pretrained(save_dir)
-    torch.save(metadata, save_dir / "gptq_quantization.pt")
+    save_ste_checkpoint(model, processor, save_dir, state_dict, metadata)
     print(f"Saved STE model and {len(layers)} quantization grids to {save_dir}")
 
 
@@ -203,6 +192,18 @@ def main():
         sequential_prefetch=False,
     )
 
+    save_dir = args.save_dir or (
+        Path(__file__).resolve().parent / "outputs"
+        / f"{Path(args.model).name}-GPTQ-W4A16"
+    )
+    if args.save_format == "ste":
+        save_ste_model(model, processor, save_dir)
+    else:
+        model.save_pretrained(save_dir, save_compressed=True)
+        processor.save_pretrained(save_dir)
+    print(f"Saved GPTQ VLM to {save_dir}")
+
+    # Save calibration results before optional sample generation can fail.
     print("========== SAMPLE GENERATION ==============")
     dispatch_model(model)
     generation_dataset = build_calibration_dataset(
@@ -216,17 +217,6 @@ def main():
     print(processor.decode(
         output[0, inputs["input_ids"].shape[-1]:], skip_special_tokens=True,
     ))
-
-    save_dir = args.save_dir or (
-        Path(__file__).resolve().parent / "outputs"
-        / f"{Path(args.model).name}-GPTQ-W4A16"
-    )
-    if args.save_format == "ste":
-        save_ste_model(model, processor, save_dir)
-    else:
-        model.save_pretrained(save_dir, save_compressed=True)
-        processor.save_pretrained(save_dir)
-    print(f"Saved GPTQ VLM to {save_dir}")
 
 
 if __name__ == "__main__":
